@@ -1,9 +1,9 @@
 // =====================================================================
-//  Serveur MCP de départ pour un agent Athena AI
-//  - expose UN outil qui récupère de vraies données publiques
-//  - renvoie ces données avec un widget interactif (public/widget.html)
+//  Agent Athena AI : Explorateur de séismes récents
+//  - serveur MCP qui expose l'outil chercher_seismes (données USGS)
+//  - renvoie les données avec un widget interactif (public/widget.html)
 //
-//  Le jour J, tu modifies surtout la section « PARTIE À CHANGER ».
+//  Pour changer de sujet, modifie surtout la section « SUJET ».
 // =====================================================================
 
 import { createServer } from "node:http";
@@ -24,8 +24,8 @@ const WIDGET_URI = "ui://widget/donnees.html";
 const widgetHtml = readFileSync(new URL("./public/widget.html", import.meta.url), "utf8");
 
 // =====================================================================
-//  PARTIE À CHANGER LE JOUR J
-//  Exemple : séismes récents, API publique de l'USGS (sans clé).
+//  SUJET : Explorateur de séismes récents
+//  Source : USGS Earthquake Hazards Program (API publique, sans clé)
 //  Doc : https://earthquake.usgs.gov/earthquakes/feed/v1.0/geojson.php
 // =====================================================================
 
@@ -34,12 +34,10 @@ const TOOL_NAME = "chercher_seismes";
 const TOOL_CONFIG = {
   title: "Chercher les séismes récents",
   // La description est lue par l'IA pour décider QUAND appeler l'outil.
-  // Sois précis : ce que l'outil fait, et quand l'utiliser.
   description:
-    "Récupère les séismes récents dans le monde (données réelles de l'USGS) " +
-    "et les affiche dans un widget interactif. À utiliser quand l'utilisateur " +
-    "parle de séismes, tremblements de terre ou activité sismique.",
-  // Les paramètres que l'IA (ou le widget) peut envoyer, avec leurs règles.
+    "Récupère les séismes récents dans le monde (données réelles de l'USGS), filtrés par période, " +
+    "magnitude minimale et lieu, et les affiche dans un widget interactif (carte, liste, filtres). " +
+    "À utiliser quand l'utilisateur parle de séismes, tremblements de terre ou activité sismique.",
   inputSchema: {
     periode: z
       .enum(["hour", "day", "week", "month"])
@@ -51,12 +49,17 @@ const TOOL_CONFIG = {
       .max(10)
       .default(2.5)
       .describe("Magnitude minimale des séismes à garder"),
+    lieu: z
+      .string()
+      .max(60)
+      .default("")
+      .describe("Mot à chercher dans le lieu, en anglais (ex. Japan, Alaska, Chile). Vide = monde entier"),
   },
 };
 
-// Les menus déroulants que le widget affiche. Quand l'utilisateur en change
-// un, le widget rappelle l'outil avec la nouvelle valeur (vraie interaction).
+// Les contrôles du widget. Changer l'un d'eux rappelle l'outil (nouvelles données).
 const CONTROLES = [
+  { name: "lieu", label: "Lieu", type: "text", placeholder: "ex. Japan" },
   {
     name: "periode",
     label: "Période",
@@ -80,31 +83,73 @@ const CONTROLES = [
   },
 ];
 
-// Va chercher les vraies données et les met dans un format GÉNÉRIQUE que le
-// widget sait afficher, quel que soit le sujet :
-//   { nom, valeur, date, lien, lat, lon, details: { "Libellé": valeur } }
-async function recupererDonnees({ periode = "week", magnitudeMin = 2.5 }) {
-  const sourceUrl = `https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_${periode}.geojson`;
-  const reponse = await fetch(sourceUrl);
-  if (!reponse.ok) throw new Error(`L'API USGS a répondu ${reponse.status}`);
-  const json = await reponse.json();
+// Catégories de magnitude : pastilles de couleur cliquables dans le widget
+const CATEGORIES = [
+  { nom: "MAJEUR", label: "Majeur (6+)", couleur: "#991b1b" },
+  { nom: "FORT", label: "Fort (5 à 6)", couleur: "#dc2626" },
+  { nom: "MODERE", label: "Modéré (4 à 5)", couleur: "#d97706" },
+  { nom: "LEGER", label: "Léger (moins de 4)", couleur: "#16a34a" },
+];
+function categorieDe(mag) {
+  if (mag == null) return "LEGER";
+  if (mag >= 6) return "MAJEUR";
+  if (mag >= 5) return "FORT";
+  if (mag >= 4) return "MODERE";
+  return "LEGER";
+}
 
-  const items = json.features
+// Petite mémoire (cache) : le flux USGS est mis à jour chaque minute,
+// on le garde 60 s pour que les interactions du widget soient instantanées.
+const cache = new Map();
+
+async function fluxUsgs(periode) {
+  const url = `https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_${periode}.geojson`;
+  const enCache = cache.get(url);
+  if (enCache && Date.now() - enCache.quand < 60 * 1000) return { url, json: enCache.json };
+  let derniere;
+  for (let essai = 1; essai <= 2; essai++) {
+    try {
+      const reponse = await fetch(url, { signal: AbortSignal.timeout(15000) });
+      if (!reponse.ok) throw new Error(`L'API USGS a répondu ${reponse.status}`);
+      const json = await reponse.json();
+      cache.set(url, { quand: Date.now(), json });
+      return { url, json };
+    } catch (e) {
+      derniere = e;
+      console.log(`[USGS] essai ${essai} échoué (${e.message})`);
+    }
+  }
+  throw derniere;
+}
+
+// Va chercher les vraies données et les met dans le format GÉNÉRIQUE du widget :
+//   { id, nom, valeur, categorie, date, lien, lat, lon, details }
+async function recupererDonnees({ periode = "week", magnitudeMin = 2.5, lieu = "" }) {
+  const { url: sourceUrl, json } = await fluxUsgs(periode);
+  const filtreLieu = lieu.trim().toLowerCase();
+
+  const tous = json.features
     .filter((f) => (f.properties.mag ?? 0) >= magnitudeMin)
+    .filter((f) => !filtreLieu || (f.properties.place ?? "").toLowerCase().includes(filtreLieu));
+
+  const items = tous
     .sort((a, b) => (b.properties.mag ?? 0) - (a.properties.mag ?? 0))
     .slice(0, 150) // on limite pour garder un widget rapide
     .map((f) => ({
       id: f.id,
       nom: f.properties.place ?? "Lieu inconnu",
       valeur: f.properties.mag,
+      categorie: categorieDe(f.properties.mag),
       date: new Date(f.properties.time).toISOString(),
       lien: f.properties.url,
       lon: f.geometry.coordinates[0],
       lat: f.geometry.coordinates[1],
       details: {
+        "Magnitude": `${f.properties.mag ?? "—"} (${f.properties.magType ?? "?"})`,
         "Profondeur (km)": f.geometry.coordinates[2],
+        "Ressenti signalé": f.properties.felt ? `${f.properties.felt} personnes` : "—",
         "Alerte tsunami": f.properties.tsunami ? "Oui" : "Non",
-        "Type": f.properties.type,
+        "Niveau d'alerte PAGER": f.properties.alert ?? "—",
       },
     }));
 
@@ -115,17 +160,26 @@ async function recupererDonnees({ periode = "week", magnitudeMin = 2.5 }) {
     sourceUrl,
     recupereLe: new Date().toISOString(),
     outil: TOOL_NAME,
-    arguments: { periode, magnitudeMin },
+    arguments: { periode, magnitudeMin, lieu },
     controles: CONTROLES,
-    total: items.length,
+    categories: CATEGORIES,
+    total: tous.length,
     items,
   };
 }
 
 // Petit résumé en texte, lu par l'IA (pas affiché dans le widget).
 function resumePourIA(data) {
+  const compte = {};
+  for (const i of data.items) compte[i.categorie] = (compte[i.categorie] ?? 0) + 1;
+  const repartition = CATEGORIES.filter((c) => compte[c.nom])
+    .map((c) => `${c.label} : ${compte[c.nom]}`)
+    .join(", ");
   const top = data.items.slice(0, 3).map((i) => `${i.nom} (${i.valeur})`).join(" ; ");
-  return `${data.total} résultats trouvés (source : ${data.source}). Les plus forts : ${top || "aucun"}.`;
+  return (
+    `${data.total} séismes trouvés (source : ${data.source}). ` +
+    `Répartition : ${repartition || "aucune"}. Les plus forts : ${top || "aucun"}.`
+  );
 }
 
 // =====================================================================

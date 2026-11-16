@@ -20,6 +20,8 @@
 
   <section id="controles" class="barre"></section>
 
+  <section id="chips" class="barre"></section>
+
   <section class="barre">
     <input id="recherche" type="search" placeholder="Rechercher…" />
     <label>Trier
@@ -76,6 +78,15 @@
   .details { margin-top: 6px; font-size: 13px; color: var(--muted); display: none; }
   li.actif .details { display: block; }
   a { color: var(--accent); }
+  .chip { border-radius: 999px; padding: 4px 12px; font-size: 13px; cursor: pointer;
+          border: 2px solid var(--c); background: transparent; color: var(--fg); }
+  .chip strong { color: var(--c); }
+  .chip.on { background: var(--c); color: #fff; }
+  .chip.on strong { color: #fff; }
+  .pill { display: inline-block; min-width: 44px; text-align: center; border-radius: 999px;
+          padding: 2px 8px; color: #fff; font-weight: 600; font-size: 13px; }
+  input[type="text"] { width: 140px; }
+  .details div { margin: 2px 0; }
 </style>
 
 <script type="module">
@@ -83,6 +94,7 @@
   let data = null;
   let actifId = null;
   let chargement = false;
+  let categorieActive = null; // filtre côté widget (clic sur une pastille)
 
   // ---------- Thème clair / sombre fourni par Athena ----------
   function appliquerTheme() {
@@ -94,6 +106,7 @@
   function recevoir(nouvelles) {
     if (!nouvelles || !Array.isArray(nouvelles.items)) return;
     data = nouvelles;
+    if (categorieActive && !data.items.some((i) => i.categorie === categorieActive)) categorieActive = null;
     // On récupère l'élément sélectionné mémorisé, s'il y en a un
     actifId = window.openai?.widgetState?.actifId ?? null;
     afficher();
@@ -122,7 +135,7 @@
 
   function majBoutons() {
     $("rafraichir").disabled = chargement;
-    document.querySelectorAll("#controles select").forEach((s) => (s.disabled = chargement));
+    document.querySelectorAll("#controles select, #controles input").forEach((s) => (s.disabled = chargement));
   }
 
   // ---------- Affichage ----------
@@ -135,7 +148,10 @@
   function itemsFiltres() {
     const q = $("recherche").value.trim().toLowerCase();
     const tri = $("tri").value;
-    let items = data.items.filter((i) => !q || String(i.nom).toLowerCase().includes(q));
+    let items = data.items.filter((i) =>
+      (!q || (String(i.nom) + " " + JSON.stringify(i.details ?? {})).toLowerCase().includes(q)) &&
+      (!categorieActive || i.categorie === categorieActive)
+    );
     items.sort((a, b) => {
       if (tri === "date") return new Date(b.date) - new Date(a.date);
       if (tri === "nom") return String(a.nom).localeCompare(String(b.nom), "fr");
@@ -150,6 +166,17 @@
     for (const c of data.controles ?? []) {
       const label = document.createElement("label");
       label.textContent = c.label;
+      if (c.type === "text") {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.placeholder = c.placeholder ?? "";
+        input.value = data.arguments?.[c.name] ?? "";
+        input.title = "Appuie sur Entrée pour lancer la recherche";
+        input.addEventListener("change", () => rappelerOutil({ [c.name]: input.value.trim() }));
+        label.appendChild(input);
+        zone.appendChild(label);
+        continue;
+      }
       const select = document.createElement("select");
       for (const o of c.options) {
         const opt = document.createElement("option");
@@ -165,6 +192,28 @@
       label.appendChild(select);
       zone.appendChild(label);
     }
+  }
+
+  function couleurDe(cat) {
+    return (data.categories ?? []).find((c) => c.nom === cat)?.couleur ?? "var(--accent)";
+  }
+
+  function afficherChips() {
+    const zone = $("chips");
+    const cats = data.categories ?? [];
+    if (!cats.length) { zone.innerHTML = ""; return; }
+    const compte = {};
+    for (const i of data.items) compte[i.categorie] = (compte[i.categorie] ?? 0) + 1;
+    zone.innerHTML = cats.filter((c) => compte[c.nom]).map((c) =>
+      `<button type="button" class="chip ${categorieActive === c.nom ? "on" : ""}" data-cat="${c.nom}" style="--c:${c.couleur}">${echapper(c.label)} <strong>${compte[c.nom]}</strong></button>`
+    ).join("") + (categorieActive ? `<button type="button" class="chip" data-cat="" style="--c:var(--muted)">Tout afficher</button>` : "");
+    zone.querySelectorAll(".chip").forEach((b) =>
+      b.addEventListener("click", () => {
+        const cat = b.dataset.cat || null;
+        categorieActive = categorieActive === cat ? null : cat;
+        afficher();
+      })
+    );
   }
 
   function afficherCarte(items) {
@@ -199,7 +248,7 @@
         .map(([k, v]) => `<div><strong>${echapper(k)} :</strong> ${echapper(v)}</div>`).join("");
       const lien = i.lien ? `<div><a href="${echapper(i.lien)}" target="_blank" rel="noopener">Voir la source</a></div>` : "";
       return `<li data-id="${echapper(i.id)}" class="${i.id === actifId ? "actif" : ""}">
-        <div class="ligne"><span>${echapper(i.nom)}</span><span class="valeur">${i.valeur ?? "–"}</span></div>
+        <div class="ligne"><span>${echapper(i.nom)}</span><span class="valeur">${i.categorie ? `<span class="pill" style="background:${couleurDe(i.categorie)}">${i.valeur ?? "–"}</span>` : (i.valeur ?? "–")}</span></div>
         <div class="muted petit">${formatDate(i.date)}</div>
         <div class="details">${details}${lien}</div>
       </li>`;
@@ -224,10 +273,11 @@
   function afficher() {
     if (!data) return;
     $("titre").textContent = data.titre ?? "Résultats";
-    $("sousTitre").textContent = `${data.total ?? data.items.length} résultats · ${data.valeurLabel ?? "Valeur"}`;
+    $("sousTitre").textContent = `${data.total ?? data.items.length} résultats (${data.items.length} affichés au maximum) · ${data.valeurLabel ?? "Valeur"}`;
     const items = itemsFiltres();
     $("compteur").textContent = `${items.length} affichés`;
     afficherControles();
+    afficherChips();
     afficherCarte(items);
     afficherListe(items);
     $("pied").innerHTML = data.source
